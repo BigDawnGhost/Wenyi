@@ -5,9 +5,9 @@ language:
   source: auto         # auto 自动检测来源语言（主攻 日/英）；也可写死 ja / en
   target: zh           # 译文语言
 
-# ── LLM：DeepSeek 双档（经 OpenAI SDK 调 https://api.deepseek.com）─────────
-# 两档都开 thinking 模式、reasoning_effort 都用 high（示例只有 high）；
-# 成本差异只靠模型区分：强档 pro 求质量，廉价档 flash 控成本。
+# ── LLM：DeepSeek 三档（经 OpenAI SDK 调 https://api.deepseek.com）─────────
+# strong/cheap 开 thinking（求质量的判断类任务）；fast 关 thinking（机械任务，
+# thinking 推理 token 按输出计费，关掉大幅省钱提速）。缺档按 fast→cheap→strong 回退。
 llm:
   provider: deepseek            # deepseek | fake（fake 用于离线测试，不发网络请求）
   base_url: https://api.deepseek.com
@@ -16,13 +16,16 @@ llm:
   max_retries: 4                # 失败重试次数（指数退避）
   tiers:
     strong:
-      model: deepseek-v4-pro    # 翻译 / 润色 / 全局分析
+      model: deepseek-v4-pro    # 翻译 / 润色 / 全局分析 / 术语审计 / 标题
       reasoning_effort: high
       thinking: true
     cheap:
-      model: deepseek-v4-flash  # 术语抽取 / 审校 / 一致性 QA / 回译抽检
+      model: deepseek-v4-flash  # 审校 / 一致性 QA / 回译比对（判断类，保留思考）
       reasoning_effort: high
       thinking: true
+    fast:
+      model: deepseek-v4-flash  # 梗概 / 全书概览 / 术语抽取 / 回译（机械任务，免思考）
+      thinking: false
 
 # ── 切分 ─────────────────────────────────────────────────────────────────
 segment:
@@ -33,14 +36,17 @@ segment:
 
 # ── 流水线开关（质量/成本平衡）───────────────────────────────────────────
 pipeline:
-  review: true              # 审校（廉价档）：漏译/误译/术语/人称检查——只上报问题供人工介入
+  review: true              # 章末整章审校（廉价档）：漏译/误译/术语/人称检查
+  autofix_severe: true      # 审校后自动重译严重项（漏译/误译，过长度校验才采纳）；关闭则仅上报留人工
   align_retry_limit: 2      # 批次翻译段数不符时的整批重试次数，超限后逐段兜底
   polish: false             # 润色（强档）：已默认关闭——它等于用 pro 把全书再翻一遍，最烧钱；需要时手动开
   backtranslate_sample: 0.05  # 回译抽检比例（0 关闭）
   consistency_qa: true      # 全书跨章一致性收尾扫描
   rolling_context_segments: 6 # 注入的前文译文尾段数
   book_understanding: true  # 翻译前预扫源文，生成全书概览+逐章梗概注入翻译（让译者对全书有理解）；
-                            # 廉价档，全书概览为恒定前缀可命中缓存复用；关掉省去预扫成本
+                            # fast 档免思考，全书概览为恒定前缀可命中缓存复用；关掉省去预扫成本
+  prescan_concurrency: 4    # 预扫逐章梗概的并发线程数（各章独立，1=串行）
+  glossary_scope: chapter   # chapter=只注入本章出现的词条+锁定人物（长书省 token）；full=全量表
 
 # ── 敬称策略（日语源专用，英语源忽略）────────────────────────────────────
 honorific:

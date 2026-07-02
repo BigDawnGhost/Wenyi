@@ -26,7 +26,8 @@ class Synopsizer(Agent):
         system = prompts.render("chapter_digest_system", src=self.src, tgt=self.tgt)
         user = prompts.render("chapter_digest_user", src=self.src, tgt=self.tgt,
                               source=source_text[:8000])
-        return self._ask_text(system, user, tier="cheap")
+        # 机械任务走 fast 档（免思考）；梗概 ≤200 字，上限留足裕量防输出失控
+        return self._ask_text(system, user, tier="fast", max_tokens=600)
 
     def book_synopsis(self, digests: list[str], analysis_brief: str) -> str:
         """把各章梗概 + 前期分析归并成全书概览。超长则分组 map-reduce。"""
@@ -65,4 +66,5 @@ class Synopsizer(Agent):
         system = prompts.render("book_synopsis_system", src=self.src, tgt=self.tgt)
         user = prompts.render("book_synopsis_user", src=self.src, tgt=self.tgt,
                               analysis=analysis_brief or "（无）", digests=numbered)
-        return self._ask_text(system, user, tier="cheap")
+        # 概览 ≤500 字，fast 档 + 上限
+        return self._ask_text(system, user, tier="fast", max_tokens=1200)

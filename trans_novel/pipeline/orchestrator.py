@@ -1,11 +1,11 @@
 """编排器：驱动全流程，章级状态机 + 断点续跑。
 
 单章流水线（章内批次**串行**，逐批刷新滚动上下文；跨章亦串行传递梗概）：
-  每批：渲染上下文（含前一批刚译出的译文）→ 检索术语 → 翻译（对齐保证）→
-        廉价校验(空译) + 审校 → 严重项逐段重译 → 润色 → 标点规范化 →
-        立即把本批译文并入滚动上下文（供下一批参照，保证连贯）。
-  章末（串行）：回译抽检 → 术语抽取入库 → 写 TM → 落盘标记 done。
-翻译前先预扫源文建立全书理解（逐章梗概+全书概览），作恒定前缀注入每章翻译。
+  每批：渲染上下文（含前一批刚译出的译文）→ 翻译（对齐保证）→ 长度校验（零成本）→
+        润色（可选）→ 标点规范化 → 立即把本批译文并入滚动上下文（供下一批参照，保证连贯）。
+  章末（串行）：整章分块审校（不阻塞翻译主路径）→ 严重项定向重译（autofix_severe，
+        过长度校验才采纳）→ 回译抽检 → 术语抽取入库 → 写 TM → 落盘标记 done。
+翻译前先预扫源文建立全书理解（逐章梗概+全书概览，fast 档并行），作恒定前缀注入每章翻译。
 
 run_all：在翻译全书后接 术语 AI 审计统一 → 一致性 QA → 写报告 → 回填出 EPUB，一气呵成。
 进度回调 progress(done_segments, total_segments, label) 与 UI 无关，每批完成即触发。
@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from ..config import Config
 from ..glossary.extractor import GlossaryExtractor
-from ..glossary.store import GlossaryStore
+from ..glossary.store import GlossaryStore, TYPE_PERSON
 from ..llm.base import LLMClient, build_client
 from ..ingest.segmenter import load_document, batch_segments
 from ..postprocess.punct import normalize_zh
@@ -114,7 +115,8 @@ class Orchestrator:
 
     def _detect_language_ai(self, doc) -> str:
         """用 LLM 检测正文主要语言，返回 ISO 代码（如 ja/en/ru）。失败返回空串。"""
-        sample = self._sample_text(doc)[:1500]
+        # labeled=False：纯源文样本，防多点采样的中文标签污染语言检测
+        sample = self._sample_text(doc, labeled=False)[:1500]
         if not sample.strip():
             return ""
         system = (
@@ -131,15 +133,28 @@ class Orchestrator:
             return ""
 
     @staticmethod
-    def _sample_text(doc) -> str:
-        for ch in doc.chapters:
-            text = "\n".join(s.source for s in ch.text_segments)
-            if len(text) > 200:
-                return text[:6000]
-        joined = "\n".join(
-            s.source for ch in doc.chapters[:2] for s in ch.text_segments
-        )
-        return joined[:6000]
+    def _sample_text(doc, *, labeled: bool = True) -> str:
+        """取风格分析样章。labeled=True 时多点采样（开头/中部/结尾各一段，带中文标注），
+        让分析覆盖全书风格全貌；labeled=False 返回单段纯源文（语言检测用，不能混入中文标签）。"""
+        texts = ["\n".join(s.source for s in ch.text_segments) for ch in doc.chapters]
+        texts = [t for t in texts if len(t) > 200]
+        if not texts:  # 兜底：全书都是短章
+            joined = "\n".join(
+                s.source for ch in doc.chapters[:2] for s in ch.text_segments)
+            return joined[:6000]
+        if not labeled:
+            return texts[0][:6000]
+        picks = [(0, "开头样章"), (len(texts) // 2, "中部样章"), (len(texts) - 1, "结尾样章")]
+        parts: list[str] = []
+        seen: set[int] = set()
+        for idx, tag in picks:
+            if idx in seen:  # 短书（1-2 章）去重，不重复取同一章
+                continue
+            seen.add(idx)
+            t = texts[idx]
+            chunk = t[-2800:] if tag == "结尾样章" else t[:2800]
+            parts.append(f"【{tag}】\n{chunk}")
+        return "\n\n".join(parts)
 
     def run(self, input_path: str, *, only_chapter: int | None = None,
             progress: Optional[ProgressFn] = None) -> RunStore:
@@ -193,17 +208,25 @@ class Orchestrator:
         manifest = store.load_manifest()
         chapters = manifest.get("chapters", [])
 
-        digests: list[str] = []
-        for i, c in enumerate(chapters):
-            ci = c.get("index", i)
-            ch = store.load_chapter(ci)
-            digest = ch.meta.get("source_digest")
-            if not digest:
-                src = "\n".join(s.source for s in ch.text_segments)
-                digest = self.synopsizer.digest_chapter(src)
-                ch.meta["source_digest"] = digest
-                store.save_chapter(ch)  # 增量落盘：续跑不重复
-            digests.append(digest or "")
+        # 各章梗概相互独立 → 并行调用（LLM 调用进线程池；落盘全部在主线程，
+        # 保持原子写不竞争，且逐章增量落盘、续跑粒度不变）。已有梗概的章跳过（幂等）。
+        loaded = {c.get("index", i): store.load_chapter(c.get("index", i))
+                  for i, c in enumerate(chapters)}
+        todo = [(ci, "\n".join(s.source for s in ch.text_segments))
+                for ci, ch in loaded.items() if not ch.meta.get("source_digest")]
+        if todo:
+            workers = max(1, self.config.pipeline.prescan_concurrency)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(self.synopsizer.digest_chapter, src): ci
+                        for ci, src in todo}
+                for fut in as_completed(futs):
+                    ci = futs[fut]
+                    loaded[ci].meta["source_digest"] = fut.result()  # 失败时 _ask_text 已回退 ""
+                    store.save_chapter(loaded[ci])
+
+        # 按 manifest 章序组装（与并发完成顺序无关）
+        digests = [loaded[c.get("index", i)].meta.get("source_digest", "") or ""
+                   for i, c in enumerate(chapters)]
 
         analysis = store.load_analysis() or {}
         synopsis = analysis.get("book_synopsis", "")
@@ -271,27 +294,35 @@ class Orchestrator:
 
         batches = batch_segments(text_segs, self.config.segment.max_chars_per_batch)
         label = f"第{ci}章 {chapter.title}"
-        # 章内术语表不变：取一次全量快照，整章各批次共用同一份。
-        # 全量（而非按批裁剪）是为了让 system+style+glossary 成为整章批次共享的稳定前缀，
-        # 命中 DeepSeek 自动前缀缓存（命中部分输入价≈0.1×），长章批次越多越省。
+        # 章内术语快照：整章各批次共用同一份（章内恒定 → system+style+glossary 成为
+        # 整章批次共享的稳定前缀，命中 DeepSeek 自动前缀缓存，命中部分输入价≈0.1×）。
+        # glossary_scope=chapter 时裁剪为「本章源文实际出现的词条（含别名命中）+ 全部锁定人物」，
+        # 长书后期全量表很大，裁剪能显著省去未命中缓存时的输入 token；full 保持全量。
         term_snapshot = glossary.all_terms()
+        if self.config.pipeline.glossary_scope == "chapter":
+            src_text = "\n".join(s.source for s in text_segs)
+            hit = {t.source for t in GlossaryStore.terms_in(term_snapshot, src_text)}
+            term_snapshot = [t for t in term_snapshot
+                             if t.source in hit or (t.type == TYPE_PERSON and t.locked)]
 
         # 逐批串行：每批渲染最新上下文 → 处理 → 立即把译文并入上下文供下一批参照。
         # 不再并发，换取章内跨批的代词/术语/语气连贯。
         # 断点续跑（段/批级）：上次中断前已译完并落盘的批次，整批跳过、不重翻，只重建上下文。
         review_issues: list[dict] = list(chapter.meta.get("review_issues", []))
         bt_samples: list[tuple[str, str]] = []
+        seg_base = 0   # 当前批首段的章内段号（issue 批内下标 → 章内段号）
         for b in batches:
             if all(s.target and s.target.strip() for s in b):
                 # 该批上次已在原位、原上下文中译完 → 复用，重建滚动上下文后跳过
                 context.add_targets([s.target for s in b])
                 done += len(b)
+                seg_base += len(b)
                 if progress:
                     progress(done, total, label)
                 continue
 
             ctx_text = context.render(self.config.pipeline.rolling_context_segments)
-            # 传整章全量术语表（不按批裁剪）：批次间 glossary 块恒定，命中前缀缓存
+            # 传章内术语快照：批次间 glossary 块恒定，命中前缀缓存
             res = self._process_batch(b, term_snapshot, ctx_text, style,
                                       book_synopsis, chapter_digest)
             for s, t in zip(b, res.targets):
@@ -299,14 +330,30 @@ class Orchestrator:
             context.add_targets(res.targets)
             for it in res.issues:
                 it["chapter"] = ci
+                it["index"] += seg_base   # 批内下标 → 章内段号
             review_issues.extend(res.issues)
             bt_samples.extend(res.bt_samples)
             done += len(b)
+            seg_base += len(b)
             if progress:
                 progress(done, total, label)
             # 增量持久化：本批译文 + 累计问题落盘，下次中断从此批之后续跑
             chapter.meta["review_issues"] = review_issues
             store.save_chapter(chapter)
+
+        # ── 章末整章审校（移出批内关键路径；块内 index 映射回章内段号）──
+        # 幂等：续跑重入章末时清掉旧审校项（只留批内长度校验项），防重复累积
+        if self.config.pipeline.review:
+            review_issues = [i for i in review_issues if i.get("stage") == "length"]
+            new_issues = self._review_chapter(text_segs, term_snapshot)
+            if self.config.pipeline.autofix_severe:
+                self._autofix_severe(text_segs, new_issues, term_snapshot, style,
+                                     book_synopsis, chapter_digest)
+            for it in new_issues:
+                it["chapter"] = ci
+                it.setdefault("fixed", False)
+                it["stage"] = "review"
+            review_issues.extend(new_issues)
 
         # 回译抽检
         bt_issues: list[dict] = []
@@ -339,30 +386,98 @@ class Orchestrator:
         "too_long": "译文明显偏长（疑似增译/失控）",
     }
 
+    # ── 章末审校 + 严重项定向重译 ────────────────────────────────────────────
+    _SEVERE_TYPES = ("missing", "mistranslation")
+
+    def _review_chapter(self, text_segs, terms) -> list[dict]:
+        """整章分块审校（章末统一做，不在批内阻塞翻译主路径）。
+
+        块 = 连续段序列（约 3 倍翻译批大小，减少调用次数与重复注入的输入 token）；
+        块内 reviewer 返回的 index 是块内下标，加块首段偏移映射回章内段号；
+        越界 index 直接丢弃（模型幻觉防御）。
+        """
+        budget = self.config.segment.max_chars_per_batch * 3
+        issues: list[dict] = []
+        base = 0
+        for chunk in self._pack_contiguous(text_segs, budget):
+            srcs = [s.source for s in chunk]
+            tgts = [s.target or "" for s in chunk]
+            for it in self.reviewer.review(srcs, tgts, terms):
+                idx = it.get("index")
+                if isinstance(idx, int) and 0 <= idx < len(chunk):
+                    it["index"] = base + idx
+                    issues.append(it)
+            base += len(chunk)
+        return issues
+
+    @staticmethod
+    def _pack_contiguous(segs, budget: int) -> list[list]:
+        """按源文字符预算把段保序打包成若干连续块。"""
+        chunks: list[list] = []
+        cur: list = []
+        size = 0
+        for s in segs:
+            if cur and size + len(s.source) > budget:
+                chunks.append(cur)
+                cur, size = [], 0
+            cur.append(s)
+            size += len(s.source)
+        if cur:
+            chunks.append(cur)
+        return chunks
+
+    def _autofix_severe(self, text_segs, issues, terms, style,
+                        book_synopsis: str = "", chapter_digest: str = "") -> None:
+        """对审校严重项（漏译/误译）带审校意见定向重译，每段最多一次。
+
+        采纳条件 = 重译非空且过长度校验：采纳则标点规范化后更新 seg.target 并标 fixed=True；
+        不采纳保持 fixed=False 留人工。章末重译时原滚动上下文已失效，用该段前后各 2 段译文做局部上下文。
+        """
+        by_seg: dict[int, list[dict]] = {}
+        for it in issues:
+            if it.get("type") in self._SEVERE_TYPES:
+                by_seg.setdefault(it["index"], []).append(it)
+        for idx, seg_issues in sorted(by_seg.items()):
+            seg = text_segs[idx]
+            before = "\n".join(text_segs[j].target or ""
+                               for j in range(max(0, idx - 2), idx))
+            after = "\n".join(text_segs[j].target or ""
+                              for j in range(idx + 1, min(len(text_segs), idx + 3)))
+            feedback = "；".join(
+                f"{it.get('detail', '')}（建议：{it.get('suggestion', '')}）"
+                for it in seg_issues)
+            new_t = self.translator.retranslate_with_feedback(
+                seg.source, feedback=feedback, glossary_terms=terms, style=style,
+                context_before=before, context_after=after,
+                book_synopsis=book_synopsis, chapter_digest=chapter_digest)
+            if new_t and not checks.length_flags([seg.source], [new_t]):
+                if self.config.punctuation_normalize:
+                    new_t = normalize_zh(new_t)
+                seg.target = new_t
+                for it in seg_issues:
+                    it["fixed"] = True
+
     def _process_batch(self, batch, terms, ctx_text: str, style: str,
                        book_synopsis: str = "", chapter_digest: str = "") -> _BatchResult:
-        """单个批次：整批翻译 → 审校/长度校验（仅上报）→ 标点规范化。
+        """单个批次：整批翻译 → 长度校验（零成本，仅上报）→ 润色 → 标点规范化。
 
         每段都在自身上下文里翻译，不跨位置复用译文（避免丢失语境信息）。
-        全书概览/本章梗概作为恒定前缀注入，让译者把握全局。问题一律 fixed=False，交人工介入。
+        全书概览/本章梗概作为恒定前缀注入，让译者把握全局。
+        LLM 审校不在批内做（移至章末统一做，见 _review_chapter，不阻塞翻译主路径）。
         """
         sources = [s.source for s in batch]
         targets = self.translator.translate_batch(
             sources, glossary_terms=terms, style=style, context=ctx_text,
             book_synopsis=book_synopsis, chapter_digest=chapter_digest)
 
+        # 无成本长度校验：空译/过短/过长作为待人工项上报（index 为批内下标，调用方映射）
         issues: list[dict] = []
-        if self.config.pipeline.review:
-            issues = self.reviewer.review(sources, targets, terms)
-        # 无成本长度校验：空译/过短/过长也作为待人工项上报
         for f in checks.length_flags(sources, targets):
             issues.append({
                 "index": f.index, "type": f.reason,
                 "detail": self._LEN_DETAIL.get(f.reason, f.reason),
-                "suggestion": "",
+                "suggestion": "", "stage": "length", "fixed": False,
             })
-        for it in issues:
-            it["fixed"] = False
 
         if self.config.pipeline.polish:
             polished = self.polisher.polish(targets, glossary_terms=terms, style=style)

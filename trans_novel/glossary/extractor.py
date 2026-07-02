@@ -20,7 +20,7 @@ class GlossaryExtractor(Agent):
             glossary=prompts.render_glossary(existing),
             source=source_text, target=target_text,
         )
-        raw = self._ask_json(system, user, tier="cheap", key="terms", default=[])
+        raw = self._ask_json(system, user, tier="fast", key="terms", default=[])
         terms: list[GlossaryTerm] = []
         for d in self.dict_items(raw):
             if not d.get("source") or not d.get("target"):

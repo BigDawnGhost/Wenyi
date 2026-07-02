@@ -23,7 +23,8 @@ class Agent:
         self.tgt = config.target_lang
 
     def _ask_json(self, system: str, user: str, *, tier: str,
-                  key: str | None = None, default: Any = _RAISE) -> Any:
+                  key: str | None = None, default: Any = _RAISE,
+                  max_tokens: int | None = None) -> Any:
         """system/user → complete_json。
 
         异常时返回 default（未给 default 则照常抛出，如 Translator 交由重试逻辑处理）。
@@ -32,7 +33,8 @@ class Agent:
         try:
             data = self.client.complete_json(
                 [{"role": "system", "content": system},
-                 {"role": "user", "content": user}], tier=tier)
+                 {"role": "user", "content": user}], tier=tier,
+                max_tokens=max_tokens)
         except Exception:
             if default is _RAISE:
                 raise
@@ -45,12 +47,13 @@ class Agent:
         return data if data else fb
 
     def _ask_text(self, system: str, user: str, *, tier: str,
-                  default: str = "") -> str:
+                  default: str = "", max_tokens: int | None = None) -> str:
         """complete 纯文本并 strip；异常返回 default。"""
         try:
             return (self.client.complete(
                 [{"role": "system", "content": system},
-                 {"role": "user", "content": user}], tier=tier) or "").strip()
+                 {"role": "user", "content": user}], tier=tier,
+                max_tokens=max_tokens) or "").strip()
         except Exception:
             return default
 

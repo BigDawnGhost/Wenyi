@@ -25,6 +25,8 @@ class Analyzer(Agent):
         data.setdefault("genre", "")
         data.setdefault("tone", "")
         data.setdefault("style_guide", "")
+        for key in ("narration", "pacing", "register", "dialogue_style", "rhetoric"):
+            data.setdefault(key, "")
         data.setdefault("characters", [])
         data.setdefault("terms", [])
         return data
@@ -68,6 +70,12 @@ class Analyzer(Agent):
             lines.append(f"语气文体：{analysis['tone']}")
         if analysis.get("style_guide"):
             lines.append(f"风格指南：{analysis['style_guide']}")
+        # 细粒度风格维度（旧 analysis.json 缺字段时自动跳过，向后兼容）
+        for key, tag in (("narration", "叙事"), ("pacing", "句式节奏"),
+                         ("register", "语域"), ("dialogue_style", "对话风格"),
+                         ("rhetoric", "修辞")):
+            if analysis.get(key):
+                lines.append(f"{tag}：{analysis[key]}")
         chars = analysis.get("characters", [])
         if chars:
             lines.append("角色：")

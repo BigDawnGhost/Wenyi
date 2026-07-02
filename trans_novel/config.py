@@ -35,14 +35,17 @@ class SegmentConfig(BaseModel):
 
 class PipelineConfig(BaseModel):
     review: bool = True
+    autofix_severe: bool = True      # 章末审校后自动重译严重项（漏译/误译）；关闭则仅上报留人工
     align_retry_limit: int = 2       # 批次翻译段数不符时的整批重试次数，超限后逐段兜底
     polish: bool = False             # 默认关：润色=用强档把全书再翻一遍，最烧钱；需要时显式开
     backtranslate_sample: float = 0.05
     consistency_qa: bool = True
     rolling_context_segments: int = 6
     # 翻译前预扫源文，生成全书概览+逐章梗概注入翻译 prompt（让译者对全书有理解）。
-    # 廉价档，且全局概览为恒定前缀可命中缓存复用；关掉可省去预扫成本。
+    # fast 档（免思考），且全局概览为恒定前缀可命中缓存复用；关掉可省去预扫成本。
     book_understanding: bool = True
+    prescan_concurrency: int = 4     # 预扫逐章梗概的并发线程数（各章独立，1=串行）
+    glossary_scope: str = "chapter"  # chapter=只注入本章出现的词条+锁定人物（省 token）；full=全量表
 
 
 class Config(BaseModel):

@@ -56,6 +56,45 @@ class Translator(Agent):
                                book_synopsis, chapter_digest)
         return out[0] if out else ""
 
+    def retranslate_with_feedback(
+        self,
+        source: str,
+        *,
+        feedback: str,
+        glossary_terms: list[GlossaryTerm] | None = None,
+        style: str = "",
+        context_before: str = "",
+        context_after: str = "",
+        book_synopsis: str = "",
+        chapter_digest: str = "",
+    ) -> str:
+        """带审校意见定向重译单段（章末 autofix 用）。失败返回空串，由调用方决定弃用。
+
+        复用 translator_system（与主翻译共享稳定前缀，命中缓存）；
+        user 用 translator_fix_user：前缀块与主翻译一致，上下文换成前文+后文译文，附审校意见。
+        """
+        system = prompts.render(
+            "translator_system", src=self.src, tgt=self.tgt, n=1,
+            lang_guidance=langprofile.translate_guidance(
+                self.src, self.config.honorific_strategy),
+        )
+        user = prompts.render(
+            "translator_fix_user", src=self.src, tgt=self.tgt,
+            style=style or "（无）",
+            book_synopsis=book_synopsis or "（无）",
+            glossary=prompts.render_glossary(glossary_terms or []),
+            chapter_digest=chapter_digest or "（无）",
+            context_before=context_before or "（无）",
+            context_after=context_after or "（无）",
+            feedback=feedback or "（无）",
+            source=source,
+        )
+        items = self._ask_json(system, user, tier="strong",
+                               key="translations", default=None)
+        if isinstance(items, list) and items:
+            return str(items[0]).strip()
+        return ""
+
     def translate_batch(
         self,
         sources: list[str],

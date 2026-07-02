@@ -1,9 +1,11 @@
 """LLM 抽象接口与具体实现。
 
 设计要点：
-- 双档 tier："strong"（deepseek-v4-pro，翻译/润色/分析）与 "cheap"
-  （deepseek-v4-flash，术语/审校/QA/回译）；两档都开 thinking 模式、
-  reasoning_effort 都用 high，成本差异只靠模型（flash vs pro）区分。
+- 三档 tier："strong"（deepseek-v4-pro + thinking，翻译/润色/分析/审计）、
+  "cheap"（deepseek-v4-flash + thinking，审校/一致性等判断类）、
+  "fast"（deepseek-v4-flash 免思考，梗概/术语抽取/回译等机械任务——
+  thinking 推理 token 按输出计费，机械任务关掉可大幅省钱提速）。
+  缺档时按回退链向"更便宜优先"回退（fast→cheap→strong），老双档配置行为不变。
 - complete() 返回纯文本；complete_json() 强制 JSON 输出并 loose 解析。
 - DeepSeekClient 经由 OpenAI SDK 调 https://api.deepseek.com，openai 惰性导入；
   未装 openai 时仍可用 FakeClient 跑通离线流程（切分/对齐/术语库/状态机）。
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional
 
@@ -23,9 +26,22 @@ from tenacity import (
     wait_exponential,
 )
 
-from ..config import Config, LLMConfig
+from ..config import Config, LLMConfig, TierConfig
 
 Messages = list[dict[str, str]]
+
+# 缺档回退链：向"更便宜优先"回退，绝不因缺档反而升到更贵的档
+_TIER_FALLBACK = {"fast": ("cheap", "strong"), "cheap": ("strong",), "strong": ()}
+
+
+def resolve_tier(tiers: dict[str, TierConfig], tier: str) -> TierConfig:
+    """按回退链解析 tier 配置。缺 strong 时 KeyError（与旧行为一致）。"""
+    if tier in tiers:
+        return tiers[tier]
+    for fb in _TIER_FALLBACK.get(tier, ("strong",)):
+        if fb in tiers:
+            return tiers[fb]
+    return tiers["strong"]
 
 
 # ── JSON 宽松解析 ────────────────────────────────────────────────────────
@@ -94,8 +110,13 @@ class DeepSeekClient(LLMClient):
         if not cfg.tiers:
             raise ValueError("配置缺少 llm.tiers")
         self._client = None  # 惰性创建
+        self._client_lock = threading.Lock()  # 预扫并行时防惰性初始化竞态
 
     def _ensure_client(self):
+        with self._client_lock:
+            return self._ensure_client_locked()
+
+    def _ensure_client_locked(self):
         if self._client is None:
             try:
                 from openai import OpenAI
@@ -123,21 +144,23 @@ class DeepSeekClient(LLMClient):
         json_mode: bool = False,
         max_tokens: Optional[int] = None,
     ) -> str:
-        tcfg = self.cfg.tiers.get(tier) or self.cfg.tiers["strong"]
+        tcfg = resolve_tier(self.cfg.tiers, tier)
         client = self._ensure_client()
 
         kwargs: dict[str, Any] = {
             "model": tcfg.model,
             "messages": messages,
             "stream": False,
-            "reasoning_effort": tcfg.reasoning_effort,
         }
         if tcfg.thinking:
+            kwargs["reasoning_effort"] = tcfg.reasoning_effort
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         if max_tokens:
-            kwargs["max_tokens"] = max_tokens
+            # DeepSeek thinking 模式下 max_tokens 含推理 token（总输出上限）。
+            # 带紧上限的调用若经回退链落到 thinking 档，抬到安全下限防推理被截断。
+            kwargs["max_tokens"] = max(max_tokens, 4096) if tcfg.thinking else max_tokens
 
         # 网络/限流/超时 → tenacity 指数退避重试（最多 max_retries 次重试）
         @retry(
@@ -173,7 +196,8 @@ class FakeClient(LLMClient):
         json_mode: bool = False,
         max_tokens: Optional[int] = None,
     ) -> str:
-        self.calls.append({"messages": messages, "tier": tier, "json_mode": json_mode})
+        self.calls.append({"messages": messages, "tier": tier,
+                           "json_mode": json_mode, "max_tokens": max_tokens})
         if self.handler is not None:
             return self.handler(messages, tier, json_mode)
         return "[]" if json_mode else ""

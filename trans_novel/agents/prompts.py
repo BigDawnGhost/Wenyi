@@ -33,14 +33,15 @@ TRANSLATOR_SYSTEM = Template("""\
 1. 忠实原文，绝不漏译、增译，绝不合并或拆分段落；保留原文分段。
 2. 输入是带编号的$src_label段落数组。必须输出等长的中文译文数组（数量与输入段落严格相等），
    顺序、数量与输入严格一一对应；第 i 个译文对应第 i 段原文。
-3. 【专有名词对照表】是**全书参考**，可能含本批未出现的词条：**只有当某词条原文确实出现在本批待译段落里，
-   才套用其固定译法**，切勿把与本批无关的词条硬塞进译文。已列词条全书统一用其译法；
+3. 【专有名词对照表】是全书对照表的**相关子集参考**，可能含本批未出现的词条：**只有当某词条原文确实出现在
+   本批待译段落里，才套用其固定译法**，切勿把与本批无关的词条硬塞进译文。已列词条全书统一用其译法；
    表中未列的专名，沿用【前文回顾】中已出现的译法，勿另起译名。
 4. 参考【全书概览】把握整体走向（主线剧情、人物弧光、伏笔与谜底），使本段措辞与后文不冲突；
    参考【本章梗概】把握本章脉络；参考【前文译文】保持衔接：代词指代、人物称谓、语气与跨段句意须自然连贯。
 5. 源语言相关要点：
 $lang_guidance
-6. 保留原文语气与文体；对话、心理、修辞按中文小说习惯自然表达，不生硬直译、不堆砌翻译腔。
+6. 保留原文语气与文体；**严格执行【风格指南】给出的叙事人称、句式节奏与语域**；
+   对话按角色的口癖/自称习惯译出辨识度；心理、修辞按中文小说习惯自然表达，不生硬直译、不堆砌翻译腔。
 7. $punct_rule
 8. 仅输出 JSON 对象：{"translations": ["第0段译文", "第1段译文", ...]}，不要任何解释或思考过程。\
 """)
@@ -65,6 +66,34 @@ $context
 $numbered_source
 
 请翻译以上每一段，输出 JSON：{"translations":[...]}，数组长度必须恰好为 $n。\
+""")
+
+TRANSLATOR_FIX_USER = Template("""\
+【角色信息 / 风格指南】
+$style
+
+【全书概览】
+$book_synopsis
+
+【专有名词对照表】（必须遵守）
+$glossary
+
+【本章梗概】
+$chapter_digest
+
+【前文译文】
+$context_before
+
+【后文译文】
+$context_after
+
+【审校意见】（首译存在的问题，重译必须修正）
+$feedback
+
+【待重译$src_label段落】（仅 1 段）
+[0] $source
+
+请重译该段，完整传达原文全部信息并与前后文衔接，输出 JSON：{"translations":["译文"]}，数组长度恰为 1。\
 """)
 
 REVIEWER_SYSTEM = Template("""\
@@ -141,7 +170,12 @@ ANALYZER_SYSTEM = Template("""\
   "genre": "体裁",
   "tone": "整体语气/文体（如：青春校园、冷峻第三人称）",
   "style_guide": "给译者的风格指南（中文，3-6 条要点）",
-  "characters": [{"source":"原文名","reading":"读音(可空)","target":"建议中文译名","gender":"男/女/未知","note":"性格/语气特征"}],
+  "narration": "叙事人称与时态（如：第一人称限知、过去时）",
+  "pacing": "句式节奏（长短句比例、断句习惯、段落密度）",
+  "register": "语域（书面/口语/文白程度）",
+  "dialogue_style": "对话风格（口癖、语气词、称呼习惯）",
+  "rhetoric": "修辞倾向（比喻密度、心理描写方式等）",
+  "characters": [{"source":"原文名","reading":"读音(可空)","target":"建议中文译名","gender":"男/女/未知","note":"性格/语气特征，须包含说话方式：自称、口癖、敬语习惯"}],
   "terms": [{"source":"原文词","reading":"读音(可空)","target":"建议中文译法","type":"地名/组织/术语","note":""}]
 }\
 """)
@@ -150,7 +184,8 @@ ANALYZER_USER = Template("""\
 【样章原文（$src_label）】
 $sample
 
-请分析并输出上述 JSON。人名、地名、专有名词尽量找全，译名力求自然且符合中文小说习惯。\
+请分析并输出上述 JSON。人名、地名、专有名词尽量找全，译名力求自然且符合中文小说习惯。
+样章可能取自全书开头/中部/结尾（见标注），请综合判断整体风格及其演变。\
 """)
 
 GLOSSARY_EXTRACTOR_SYSTEM = Template("""\
@@ -239,6 +274,7 @@ $digests
 _DEFAULTS = {
     "translator_system": TRANSLATOR_SYSTEM,
     "translator_user": TRANSLATOR_USER,
+    "translator_fix_user": TRANSLATOR_FIX_USER,
     "reviewer_system": REVIEWER_SYSTEM,
     "reviewer_user": REVIEWER_USER,
     "polisher_system": POLISHER_SYSTEM,

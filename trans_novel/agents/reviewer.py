@@ -47,7 +47,7 @@ class BackTranslator(Agent):
         system = prompts.render("backtranslate_system", src=self.src, tgt=self.tgt)
         user = prompts.render("backtranslate_user", src=self.src, tgt=self.tgt,
                               n=len(targets), numbered_target=prompts.numbered(targets))
-        items = self._ask_json(system, user, tier="cheap",
+        items = self._ask_json(system, user, tier="fast",  # 机械回译免思考；语义比对(check)仍走 cheap
                                key="backtranslations", default=[])
         return [str(x) for x in items] if isinstance(items, list) else []
 

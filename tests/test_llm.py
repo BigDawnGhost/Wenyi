@@ -23,6 +23,31 @@ class TestParseJsonLoose(unittest.TestCase):
             parse_json_loose("没有任何 JSON 内容")
 
 
+class TestResolveTier(unittest.TestCase):
+    def test_fallback_chain(self):
+        from trans_novel.config import TierConfig
+        from trans_novel.llm.base import resolve_tier
+
+        strong = TierConfig(model="pro")
+        cheap = TierConfig(model="flash")
+        fast = TierConfig(model="flash", thinking=False)
+
+        # 三档全有 → 各归各
+        tiers = {"strong": strong, "cheap": cheap, "fast": fast}
+        self.assertIs(resolve_tier(tiers, "fast"), fast)
+        self.assertIs(resolve_tier(tiers, "cheap"), cheap)
+        self.assertIs(resolve_tier(tiers, "strong"), strong)
+        # 无 fast → 落 cheap（不升到更贵的 strong）
+        tiers2 = {"strong": strong, "cheap": cheap}
+        self.assertIs(resolve_tier(tiers2, "fast"), cheap)
+        # 只有 strong → 都落 strong
+        tiers3 = {"strong": strong}
+        self.assertIs(resolve_tier(tiers3, "fast"), strong)
+        self.assertIs(resolve_tier(tiers3, "cheap"), strong)
+        # 未知档 → 落 strong
+        self.assertIs(resolve_tier(tiers, "unknown"), strong)
+
+
 class TestFakeClient(unittest.TestCase):
     def test_default(self):
         c = FakeClient()
